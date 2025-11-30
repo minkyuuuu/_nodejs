@@ -14,16 +14,90 @@ const youtube = google.youtube({
   auth: process.env.YOUTUBE_API_KEY,
 });
 
+// ---------------------------------------------------------
+// 1. 유튜버 핸들(ID)로 채널 정보 찾기 (추가된 기능)
+// ---------------------------------------------------------
+app.get('/api/find-channel', async (req, res) => {
+    const { handle } = req.query; // 클라이언트에서 ?handle=@abc 형태로 보냄
+    if (!handle) return res.status(400).json({ error: 'Handle is required' });
+
+    try {
+        // search.list를 사용하여 채널 검색
+        const response = await youtube.search.list({
+            part: 'snippet',
+            type: 'channel',
+            q: handle, // 검색어 (@핸들)
+            maxResults: 1, // 가장 정확한 1개만
+        });
+
+        if (response.data.items.length === 0) {
+            return res.status(404).json({ error: 'Channel not found' });
+        }
+
+        const channel = response.data.items[0];
+        res.json({
+            channelId: channel.snippet.channelId,
+            title: channel.snippet.channelTitle,
+            thumbnail: channel.snippet.thumbnails.default.url,
+            description: channel.snippet.description
+        });
+
+    } catch (error) {
+        console.error('Channel Search Error:', error.message);
+        res.status(500).json({ error: 'Failed to search channel' });
+    }
+});
+
+// ---------------------------------------------------------
+// 2. 특정 채널의 재생목록 리스트 가져오기 (추가된 기능)
+// ---------------------------------------------------------
+app.get('/api/channel-playlists', async (req, res) => {
+    const { channelId } = req.query;
+    if (!channelId) return res.status(400).json({ error: 'Channel ID is required' });
+
+    try {
+        let allPlaylists = [];
+        let nextPageToken = null;
+
+        // 재생목록이 50개가 넘을 수 있으니 페이지네이션 처리
+        do {
+            const response = await youtube.playlists.list({
+                part: 'snippet,contentDetails',
+                channelId: channelId,
+                maxResults: 50,
+                pageToken: nextPageToken
+            });
+
+            const playlists = response.data.items.map(item => ({
+                id: item.id,
+                title: item.snippet.title,
+                thumbnail: item.snippet.thumbnails.medium?.url || item.snippet.thumbnails.default.url,
+                itemCount: item.contentDetails.itemCount
+            }));
+
+            allPlaylists = allPlaylists.concat(playlists);
+            nextPageToken = response.data.nextPageToken;
+
+        } while (nextPageToken);
+
+        res.json({ playlists: allPlaylists });
+
+    } catch (error) {
+        console.error('Playlist Fetch Error:', error.message);
+        res.status(500).json({ error: 'Failed to fetch playlists' });
+    }
+});
+
+// ---------------------------------------------------------
+// 3. 특정 재생목록의 동영상 리스트 가져오기 (기존 기능 유지)
+// ---------------------------------------------------------
 app.get('/api/playlist/:playlistId', async (req, res) => {
   const { playlistId } = req.params;
-  if (!playlistId) {
-    return res.status(400).json({ error: 'Playlist ID is required' });
-  }
+  if (!playlistId) return res.status(400).json({ error: 'Playlist ID is required' });
 
   try {
-    // 1단계: 재생목록의 기본 정보(제목) 가져오기
+    // 3-1. 재생목록 기본 정보
     const playlistResponse = await youtube.playlists.list({
-        // ❗ part: 배열이 아닌 단일 문자열로 수정
         part: 'snippet',
         id: playlistId,
     });
@@ -33,7 +107,7 @@ app.get('/api/playlist/:playlistId', async (req, res) => {
     }
     const playlistTitle = playlistResponse.data.items[0].snippet.title;
 
-    // 2단계: 재생목록의 모든 동영상 ID 가져오기 (페이지네이션 처리)
+    // 3-2. 동영상 ID 가져오기
     let videoIds = [];
     let nextPageToken = null;
     do {
@@ -44,7 +118,6 @@ app.get('/api/playlist/:playlistId', async (req, res) => {
         pageToken: nextPageToken,
       });
       playlistItemsResponse.data.items.forEach(item => {
-        // 비공개 동영상 등 ID가 없는 경우를 방지
         if (item.snippet?.resourceId?.videoId) {
             videoIds.push(item.snippet.resourceId.videoId);
         }
@@ -56,20 +129,17 @@ app.get('/api/playlist/:playlistId', async (req, res) => {
         return res.json({ playlistTitle, totalCount: 0, videos: [] });
     }
 
-    // 3단계: 모든 동영상 ID를 50개씩 나누어 상세 정보 요청
+    // 3-3. 동영상 상세 정보 (duration 등)
     let allVideoDetails = [];
     for (let i = 0; i < videoIds.length; i += 50) {
       const videoIdChunk = videoIds.slice(i, i + 50);
-
       const videoDetailsResponse = await youtube.videos.list({
         part: 'snippet,contentDetails',
-        id: videoIdChunk.join(','), // 쉼표로 구분된 문자열로 전달
+        id: videoIdChunk.join(','),
       });
-      
       allVideoDetails = allVideoDetails.concat(videoDetailsResponse.data.items);
     }
     
-    // 4단계: 프론트엔드로 보낼 최종 데이터 가공
     const videos = allVideoDetails.map(item => ({
       id: item.id,
       title: item.snippet.title,
@@ -78,7 +148,7 @@ app.get('/api/playlist/:playlistId', async (req, res) => {
       duration: item.contentDetails.duration,
     }));
     
-    // 원본 재생목록 순서대로 정렬
+    // 순서 정렬
     const sortedVideos = videoIds.map(id => videos.find(video => video.id === id)).filter(Boolean);
 
     res.json({
